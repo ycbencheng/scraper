@@ -1,65 +1,115 @@
 require "httparty"
 require "nokogiri"
 require "parallel"
+require "byebug"
 
-list_of_sites = []
+class Scraper
+  def initialize(csv)
+    @csv = csv
+    @company = Struct.new(:name, :email, :site, :facebook, :phone)
+    @companies = []
+    @semaphore = Mutex.new
+    @csv_headers = %w(name, email, site, facebook, phone)
+    @body = nil
+  end
 
-struct = Struct.new(:site, :email, :facebook, :phone)
+  def run
+    csv = CSV.table(@csv)
+    scrape(csv[:site])
+  end
 
-list_of_info = []
+  def scrape(sites)
+    puts "Start scraping"
 
-semaphore = Mutex.new
-csv_headers = ['site', 'email', 'facebook']
+    Parallel.map(sites, in_threads: 4) do |site|
+      puts "Getting info on - #{site}"
 
-Parallel.map(list_of_sites, in_threads: 2) do |site|
-  begin
-    puts "Getting info on - #{site}"
+      html = html_response(site)
 
-    response = HTTParty.get(site, {
+      if html.code < 400
+        @body = Nokogiri::HTML(html.body)
+
+        email = parse_email
+        facebook = parse_fb
+        phone = parse_phone
+        # n = parse_name
+      else
+        puts "Warning #{site} is not available!"
+      end
+
+      company_struct = @company.new(n, email, site, facebook, phone)
+
+      @semaphore.synchronize {
+        @companies.push(company_struct)
+      }
+    end
+
+    puts "Total of #{@companies.count}"
+
+    create_csv
+  end
+
+  private
+
+  def create_csv
+    puts "Creating a new CSV!"
+
+    CSV.open("#{@csv}_info.csv", "wb", write_headers: true, headers: @csv_headers) do |csv|
+      @companies.each do |company|
+        puts "Writing #{company.site} & #{company.email}"
+        csv << company
+      end
+    end
+
+    puts "Done!"
+  end
+
+  def html_response(site)
+    HTTParty.get(site, {
       headers: {
         "User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36"
       },
     })
-
-    doc = Nokogiri::HTML(response.body)
-
-    email_selector = "//a[starts-with(@href, \"mailto:\")]/@href"
-    emails = doc.xpath(email_selector)
-    email  = emails.collect {|n| n.value[7..-1]}.uniq.first if emails.any?
-    puts "Got the email - #{email}"
-
-    facebook_selector = "//a[starts-with(@href, \"https://www.facebook.com\")]/@href"
-    facebooks = doc.xpath(facebook_selector)
-    facebook = facebooks.map(&:to_s).uniq.first if facebooks.any?
-    puts "Got the facebook - #{facebook}"
-
-    phone_selector = "//a[starts-with(@href, \"tel:\")]/@href"
-    phones = doc.xpath(phone_selector)
-    phone = phones.collect {|n| n.value[4..-1]}.uniq.first
-    puts "Got the phone - #{phone}"
-  rescue
-    puts "Warning #{site} is not available!"
   end
 
-  info_struct = struct.new(site, email, facebook, phone)
+  def parse_name
+    # parse for dr name or manager, or front desk
+    data = extractor(selector("//a[starts-with(@href, \"#{label}\")]/@href"))
+    cleaned_data = names
+    logging(__method__, cleaned_data)
+  end
 
-  semaphore.synchronize {
-    list_of_info.push(info_struct)
-  }
-end
+  def parse_email
+    # parse better email
+    data = extractor(href_selector("mailto:"))
+    cleaned_data = data.collect {|n| n.value[7..-1]}.uniq.first if data.any?
+    logging(__method__, cleaned_data)
+    data
+  end
 
-puts "Total of #{list_of_info.count}"
+  def parse_fb
+    data = extractor(href_selector("https://www.facebook.com"))
+    cleaned_data = data.map(&:to_s).uniq.first if data.any?
+    logging(__method__, cleaned_data)
+    data
+  end
 
-puts "Starting CSV!"
+  def parse_phone
+    data = extractor(href_selector("tel:"))
+    cleaned_data = data.collect {|n| n.value[4..-1]}.uniq.first if data.any?
+    logging(__method__, cleaned_data)
+    data
+  end
 
-CSV.open("new_psychiatrists.csv", "wb", write_headers: true, headers: csv_headers) do |csv|
-  list_of_info.each do |info|
-    puts "Writing #{info.site} & #{info.email}"
-    csv << info
+  def href_selector(label)
+    "//a[starts-with(@href, \"#{label}\")]/@href"
+  end
+
+  def extractor(selector)
+    @body.xpath(selector)
+  end
+
+  def logging(method, data)
+    puts "#{method} - #{data}"
   end
 end
-
-puts "Done!"
-
-
-
