@@ -1,10 +1,8 @@
 require "httparty"
 require "nokogiri"
 require "parallel"
-require "selenium-webdriver"
-require 'uri'
 
-list_of_sites = ['https://www.blackhurstfamilydental.com/']
+list_of_sites = []
 
 struct = Struct.new(:site, :email, :facebook, :phone)
 
@@ -15,7 +13,7 @@ csv_headers = ['site', 'email', 'facebook']
 
 Parallel.map(list_of_sites, in_threads: 2) do |site|
   begin
-    puts "Getting #{site}"
+    puts "Getting info on - #{site}"
 
     response = HTTParty.get(site, {
       headers: {
@@ -28,19 +26,16 @@ Parallel.map(list_of_sites, in_threads: 2) do |site|
     email_selector = "//a[starts-with(@href, \"mailto:\")]/@href"
     emails = doc.xpath(email_selector)
     email  = emails.collect {|n| n.value[7..-1]}.uniq.first if emails.any?
-
-
+    puts "Got the email - #{email}"
 
     facebook_selector = "//a[starts-with(@href, \"https://www.facebook.com\")]/@href"
     facebooks = doc.xpath(facebook_selector)
     facebook = facebooks.map(&:to_s).uniq.first if facebooks.any?
+    puts "Got the facebook - #{facebook}"
 
     phone_selector = "//a[starts-with(@href, \"tel:\")]/@href"
     phones = doc.xpath(phone_selector)
     phone = phones.collect {|n| n.value[4..-1]}.uniq.first
-
-    puts "Got the email - #{email}"
-    puts "Got the facebook - #{facebook}"
     puts "Got the phone - #{phone}"
   rescue
     puts "Warning #{site} is not available!"
@@ -51,16 +46,13 @@ Parallel.map(list_of_sites, in_threads: 2) do |site|
   semaphore.synchronize {
     list_of_info.push(info_struct)
   }
-
-  puts "info_struct - #{info_struct}"
 end
 
 puts "Total of #{list_of_info.count}"
 
 puts "Starting CSV!"
 
-
-CSV.open("output.csv", "wb", write_headers: true, headers: csv_headers) do |csv|
+CSV.open("new_psychiatrists.csv", "wb", write_headers: true, headers: csv_headers) do |csv|
   list_of_info.each do |info|
     puts "Writing #{info.site} & #{info.email}"
     csv << info
