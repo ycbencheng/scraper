@@ -24,20 +24,23 @@ class Scraper
     Parallel.map(sites, in_threads: 4) do |site|
       puts "Getting info on - #{site}"
 
-      html = html_response(site)
+      begin
+        html = html_response(site)
+        if html.code < 400
+          @body = Nokogiri::HTML(html.body)
 
-      if html.code < 400
-        @body = Nokogiri::HTML(html.body)
-
-        email = parse_email
-        facebook = parse_fb
-        phone = parse_phone
-        # n = parse_name
-      else
-        puts "Warning #{site} is not available!"
+          # n = parse_name
+          email = parse_email
+          facebook = parse_fb
+          phone = parse_phone
+        else
+          puts "Warning error code - #{html.code}"
+        end
+      rescue StandardError => e
+        puts "Warning #{site} is not available! Error - #{e.message}"
       end
 
-      company_struct = @company.new(n, email, site, facebook, phone)
+      company_struct = @company.new('', email, site, facebook, phone)
 
       @semaphore.synchronize {
         @companies.push(company_struct)
@@ -80,25 +83,32 @@ class Scraper
   end
 
   def parse_email
-    # parse better email
     data = extractor(href_selector("mailto:"))
-    cleaned_data = data.collect {|n| n.value[7..-1]}.uniq.first if data.any?
+    cleaned_data = if data.any?
+             data.collect {|n| n.value[7..-1]}.uniq.first
+           else
+             selector = "//*[contains(*, '.com')]"
+             data = extractor(selector)
+             emails = data.text.scan(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[com]{2,4}\b/i)
+             emails.uniq.first
+           end
+
     logging(__method__, cleaned_data)
-    data
+    cleaned_data
   end
 
   def parse_fb
     data = extractor(href_selector("https://www.facebook.com"))
     cleaned_data = data.map(&:to_s).uniq.first if data.any?
     logging(__method__, cleaned_data)
-    data
+    cleaned_data
   end
 
   def parse_phone
     data = extractor(href_selector("tel:"))
     cleaned_data = data.collect {|n| n.value[4..-1]}.uniq.first if data.any?
     logging(__method__, cleaned_data)
-    data
+    cleaned_data
   end
 
   def href_selector(label)
