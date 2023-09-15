@@ -1,35 +1,57 @@
 require "httparty"
 require "nokogiri"
 require "parallel"
+require "phonelib"
+require 'sanitize'
+
+# debug
 require "byebug"
 
 class Scraper
   def initialize(csv)
     @csv = csv
-    @company = Struct.new(:name, :email, :site, :facebook, :phone, :error)
+    @company = Struct.new(:email, :site, :facebook, :phone, :html, :error)
     @companies = []
     @semaphore = Mutex.new
-    @csv_headers = %w(name, email, site, facebook, phone, error)
+    @csv_headers = %w(email site facebook phone html error)
     @body = nil
   end
 
   def run
+    starting = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
     csv = CSV.table(@csv)
-    scrape(csv[:site])
+    clean_sites = dedup(csv[:site])
+    scrape(clean_sites)
+    create_csv
+
+    ending = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    elapsed = ending - starting
+    puts "Total time - #{elapsed.round(2)} second"
+  end
+
+  def dedup(sites)
+    clean_sites = sites.map do |site|
+      site.sub(%r{^https?:(//|\\\\)(www\.)?}i, '').split('/').first
+    end.uniq
+
+    puts "--- Total of #{clean_sites.count} sites!!! ---"
+
+    clean_sites.map do |site|
+      "https://#{site}"
+    end
   end
 
   def scrape(sites)
-    puts "Start scraping"
-
-    Parallel.map(sites, in_threads: 4) do |site|
-      puts "Getting info on - #{site}"
+    Parallel.map_with_index(sites, in_threads: 4) do |site, index|
+      puts "#{index + 1}"
 
       begin
-        html = html_response(site)
-        if html.code < 400
-          @body = Nokogiri::HTML(html.body)
+        raw_html = html_response(site)
 
-          name = parse_name
+        if raw_html.code < 400
+          @body = Nokogiri::HTML(raw_html.body)
+
           email = parse_email
           facebook = parse_fb
           phone = parse_phone
@@ -40,36 +62,25 @@ class Scraper
         error = "Connection Error - #{e.message}"
       end
 
-      puts error ? error : "Got some info on the company"
+      html = Sanitize.fragment(raw_html)
+      error = error ? "404" : ""
 
-      company_struct = @company.new(name, email, site, facebook, phone, error)
+      company_struct = @company.new(email, site, facebook, phone, html, error)
 
       @semaphore.synchronize {
         @companies.push(company_struct)
       }
     end
-
-    puts "Total of #{@companies.count}"
-
-    # dedup the site
-    # skip if the site is mountainstar, ihc, stmarks, intermountainhealthcare, .gov, .edu, reverehealth, lenscrafter, target, walmart
-    # check if the phone number, website is the same
-
-    create_csv
   end
 
   private
 
   def create_csv
-    puts "Creating a new CSV!"
-
     CSV.open("#{@csv}_info.csv", "wb", write_headers: true, headers: @csv_headers) do |csv|
       @companies.each do |company|
         csv << company
       end
     end
-
-    puts "Done!"
   end
 
   def html_response(site)
@@ -80,55 +91,30 @@ class Scraper
     })
   end
 
-  def parse_name
-    data = extractor("//*[contains(*, \"dr\")]")
-
-    _, raw_name = data.text.downcase.split('dr.')
-
-    cleaned_data = if raw_name.nil?
-                     nil
-                   elsif raw_name.split().first == '.'
-                     raw_name.split().first(2).unshift('Dr').insert(2, " ").map{|rn| rn.capitalize}.join()
-                   else
-                    raw_name.split().first(1).unshift('Dr').insert(1, " ").map{|rn| rn.capitalize}.join()
-                   end
-
-    logging(__method__, cleaned_data)
-
-    cleaned_data
-  end
-
   def parse_email
     data = extractor(href_selector("mailto:"))
-    #look for span, div, p
-    cleaned_data = if data.any?
-                     data.collect {|n| n.value[7..-1]}.uniq.first
-                   else
-                     data = extractor("//*[contains(*, '.com')]")
-                     emails = data.text.scan(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[com]{2,4}\b/i)
-                     emails.uniq.first
-                   end
 
-    logging(__method__, cleaned_data)
-
-    cleaned_data
+    if data.any?
+       data.collect {|n| n.value[7..-1]}.uniq.first
+     else
+       data = extractor("//*[contains(*, '.com')]")
+       emails = data.text.scan(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[com]{2,4}\b/i)
+       emails.uniq.first
+     end
   end
 
   def parse_fb
     data = extractor(href_selector("https://www.facebook.com"))
-    cleaned_data = data.map(&:to_s).uniq.first if data.any?
-
-    logging(__method__, cleaned_data)
-
-    cleaned_data
+    data.map(&:to_s).uniq.first if data.any?
   end
 
   def parse_phone
     data = extractor(href_selector("tel:"))
-    # clean phone
-    cleaned_data = data.collect {|n| n.value[4..-1]}.uniq.first if data.any?
-    logging(__method__, cleaned_data)
-    cleaned_data
+
+    if data.any
+      num = data.collect {|n| n.value[4..-1]}.uniq.first
+      Phonelib.parse(num, 'US').local_number
+    end
   end
 
   def href_selector(label)
@@ -137,9 +123,5 @@ class Scraper
 
   def extractor(selector)
     @body.xpath(selector)
-  end
-
-  def logging(method, data)
-    puts "#{method} - #{data}"
   end
 end
