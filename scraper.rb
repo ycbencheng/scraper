@@ -95,12 +95,12 @@ class Scraper
     data = extractor(href_selector("mailto:"))
 
     if data.any?
-       data.collect {|n| n.value[7..-1]}.uniq.first
-     else
-       data = extractor("//*[contains(*, '.com')]")
-       emails = data.text.scan(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[com]{2,4}\b/i)
-       emails.uniq.first
-     end
+      data.collect {|n| n.value[7..-1]}.uniq.first
+    else
+      data = extractor("//*[contains(*, '.com')]")
+      emails = data.text.scan(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[com]{2,4}\b/i)
+      emails.uniq.first
+    end
   end
 
   def parse_fb
