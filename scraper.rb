@@ -111,9 +111,10 @@ class Scraper
   def parse_phone
     data = extractor(href_selector("tel:"))
 
-    if data.any
-      num = data.collect {|n| n.value[4..-1]}.uniq.first
-      Phonelib.parse(num, 'US').local_number
+    if data.any?
+      data.map do |d|
+        Phonelib.parse(d, 'US').national_number
+      end.uniq.first
     end
   end
 
