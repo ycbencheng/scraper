@@ -8,3 +8,5 @@ gem 'sanitize'
 
 # debug
 gem 'byebug'
+
+gem 'ferrum'
