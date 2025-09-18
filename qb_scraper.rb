@@ -1,14 +1,11 @@
-require "httparty"
 require "nokogiri"
 require "parallel"
-require "phonelib"
-require 'sanitize'
 require 'csv'
 require 'optparse'
 require 'ferrum'
 require 'json'
-require 'fileutils'
 require "uri"
+require 'byebug'
 
 class QbScraper
   USER_AGENTS = [
@@ -43,18 +40,18 @@ class QbScraper
     @proxy_list = options.fetch(:proxy_list, []) # strings like "host:port" or "http://user:pass@host:port"
     @headless = options.fetch(:headless, true)
     @timeout = options.fetch(:timeout, 30)
-    @min_between = options.fetch(:min_between, 5)
-    @max_between = options.fetch(:max_between, 18)
+    @min_between = options.fetch(:min_between, 20)
+    @max_between = options.fetch(:max_between, 45)
     @retries = options.fetch(:retries, 2)
     @csv_filename = options.fetch(:csv_filename, "proadvisor_results_incremental.csv")
-    @proadvisor = Struct.new(:accountant_name, :title_text, :emails, :social_sites, :proadvisor_link, :website_info, :error)
+    @proadvisor = Struct.new(:accountant_name, :title_text, :emails, :social_sites, :proadvisor_link, :site, :error)
     @mutex = Mutex.new
     ensure_csv_initialized
   end
 
   def run(direct_urls = [])
     start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    urls = load_urls(direct_urls)
+    urls = load_urls(direct_urls).shuffle
     return if urls.empty?
 
     puts "--- Total of #{urls.count} ProAdvisor URLs to scrape ---"
@@ -82,7 +79,7 @@ class QbScraper
   end
 
   def csv_headers
-    %w(accountant_name title_text emails social_sites proadvisor_link website_info error)
+    %w(accountant_name title_text emails social_sites proadvisor_link site error)
   end
 
   def append_result_row(row_array)
@@ -125,11 +122,16 @@ class QbScraper
     browser = build_browser_for_context(proxy: pick_proxy_for_request(nil), user_agent: pick_user_agent)
     begin
       urls.each_with_index do |url, idx|
+        start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         puts "Processing #{idx + 1} of #{urls.count}: #{url}"
+
         html = fetch_with_retries(browser, url)
         pro = build_proadvisor_from_html(html, url)
         append_result_row(pro.to_a)
-        puts "Saved: #{url}"
+
+        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
+        puts "Saved: #{url} (#{elapsed.round(2)}s)"
+
         sleep(rand(@min_between..@max_between))
       end
     ensure
@@ -139,15 +141,21 @@ class QbScraper
 
   def scrape_in_parallel(urls)
     Parallel.each(urls, in_threads: @concurrency) do |url|
+      start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+      sleep(rand(3.5..7.5))
       proxy = pick_proxy_for_request(Thread.current.object_id)
       user_agent = pick_user_agent
       browser = build_browser_for_context(proxy: proxy, user_agent: user_agent)
+
       begin
-        sleep(rand(0.3..2.0))
         html = fetch_with_retries(browser, url)
         pro = build_proadvisor_from_html(html, url)
         append_result_row(pro.to_a)
-        puts "[worker #{Thread.current.object_id}] Saved: #{url}"
+
+        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
+        puts "[worker #{Thread.current.object_id}] Saved: #{url} (#{elapsed.round(2)}s)"
+
         sleep(rand(@min_between..@max_between))
       ensure
         browser.quit if browser
@@ -209,6 +217,7 @@ class QbScraper
   end
 
   def simulate_reading_pause(browser)
+    # Base pause
     roll = rand
     if roll < 0.6
       sleep(rand(1.0..4.0))
@@ -218,14 +227,25 @@ class QbScraper
       sleep(rand(18..35))
     end
 
-    # occasional viewport resize to add variability (non-fingerprinting)
-    if rand < 0.08
-      begin
-        w = 1000 + rand(-150..300)
-        h = 800 + rand(-150..200)
-        browser.resize(w, h) if browser.respond_to?(:resize)
-      rescue
+    body = begin
+      browser.at_xpath("body")
+    rescue
+      nil
+    end
+
+    if body
+      1.upto(rand(1..3)) do
+        y_pos = rand(80..700)
+        body.scroll_to(y: y_pos)
+        sleep(rand(0.2..0.6))
       end
+    end
+
+    # Random viewport resize
+    if rand < 0.08
+      w = 1000 + rand(-150..300)
+      h = 800 + rand(-150..200)
+      browser.resize(w, h) if browser.respond_to?(:resize)
     end
   end
 
@@ -245,8 +265,8 @@ class QbScraper
     ])
     emails = parse_emails_from_body(body)
     social_sites = parse_social_sites_from_body(body)
-    website_info = parse_website_info_from_body(body)
-    @proadvisor.new(accountant_name, title_text, emails, social_sites, url, website_info, nil)
+    site = parse_site_from_body(body)
+    @proadvisor.new(accountant_name, title_text, emails, social_sites, url, site, nil)
   rescue StandardError => e
     @proadvisor.new(nil, nil, nil, nil, url, nil, "Scraping Error - #{e.message}")
   end
@@ -310,7 +330,7 @@ class QbScraper
   end
 
 
-  def parse_website_info_from_body(body)
+  def parse_site_from_body(body)
     websites = []
     website_selectors = [
       "//a[contains(@class, 'website')]/@href","//a[contains(@class, 'url')]/@href",
