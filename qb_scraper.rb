@@ -1,9 +1,8 @@
 require "nokogiri"
 require "parallel"
 require 'csv'
-require 'optparse'
 require 'ferrum'
-require 'json'
+require 'launchy'
 require "uri"
 require 'byebug'
 
@@ -40,28 +39,25 @@ class QbScraper
     @proxy_list = options.fetch(:proxy_list, []) # strings like "host:port" or "http://user:pass@host:port"
     @headless = options.fetch(:headless, true)
     @timeout = options.fetch(:timeout, 30)
-    @min_between = options.fetch(:min_between, 20)
-    @max_between = options.fetch(:max_between, 45)
-    @retries = options.fetch(:retries, 2)
+    @min_between = options.fetch(:min_between, 8.0)
+    @max_between = options.fetch(:max_between, 10.0)
+    @retries = options.fetch(:retries, 3)
     @csv_filename = options.fetch(:csv_filename, "proadvisor_results_incremental.csv")
     @proadvisor = Struct.new(:accountant_name, :title_text, :emails, :social_sites, :proadvisor_link, :site, :error)
     @mutex = Mutex.new
+
     ensure_csv_initialized
   end
 
   def run(direct_urls = [])
     start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    urls = load_urls(direct_urls).shuffle
+    urls = load_urls(direct_urls)
     return if urls.empty?
 
     puts "--- Total of #{urls.count} ProAdvisor URLs to scrape ---"
     puts "Concurrency: #{@concurrency}, Headless: #{@headless}, Proxies: #{@proxy_list.any?}"
 
-    if @concurrency > 1
-      scrape_in_parallel(urls)
-    else
-      scrape_sequential(urls)
-    end
+    scrape_sequential(urls)
 
     total_elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
     puts "Done. Total time - #{total_elapsed.round(2)} seconds"
@@ -104,8 +100,26 @@ class QbScraper
         csv = CSV.table(@input_source)
         urls = csv[:url] || csv[:link] || csv[:site] || []
         urls = urls.compact.map(&:to_s)
+
+        # Remove URLs already in incremental CSV
+        existing_urls = File.exist?(@csv_filename) ? CSV.read(@csv_filename, headers: true).map { |row| row['proadvisor_link'] }.compact : []
+        urls.reject! { |u| existing_urls.include?(u) }
+        urls.uniq!
+
+        # Overwrite original CSV with remaining URLs
+        CSV.open(@input_source, "wb", write_headers: true, headers: csv.headers) do |csv_file|
+          csv.each do |row|
+            row_url = row[:url] || row[:link] || row[:site]
+            csv_file << row if row_url && urls.include?(row_url.to_s)
+          end
+        end
       else
         urls = File.readlines(@input_source).map(&:strip).reject(&:empty?)
+        # Remove URLs already in incremental CSV
+        existing_urls = File.exist?(@csv_filename) ? CSV.read(@csv_filename, headers: true).map { |row| row['proadvisor_link'] }.compact : []
+        urls.reject! { |u| existing_urls.include?(u) }
+        urls.uniq!
+        File.write(@input_source, urls.join("\n"))
       end
     end
 
@@ -115,50 +129,81 @@ class QbScraper
       u
     end
 
+    puts "Running dedup ...."
     urls
   end
 
   def scrape_sequential(urls)
+    total_urls = urls.size
     browser = build_browser_for_context(proxy: pick_proxy_for_request(nil), user_agent: pick_user_agent)
+
     begin
       urls.each_with_index do |url, idx|
-        start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        puts "Processing #{idx + 1} of #{urls.count}: #{url}"
+        log_event(:outgoing, "Starting #{idx + 1}/#{total_urls}, Url: #{url}")
+        retries_left = 3
+        start_time_row = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
-        html = fetch_with_retries(browser, url)
-        pro = build_proadvisor_from_html(html, url)
-        append_result_row(pro.to_a)
+        while retries_left > 0
+          html = fetch_with_retries(browser, url)
+          if html.nil?
+            puts "Failed to fetch #{url}, skipping..."
+            break
+          end
 
-        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
-        puts "Saved: #{url} (#{elapsed.round(2)}s)"
+          if blocked_page?(html, url)
+            puts "Blocked detected. Open browser and solve CAPTCHA (waiting 30s)..."
+            Launchy.open(url)
+            sleep(30)
 
-        sleep(rand(@min_between..@max_between))
+            retries_left -= 1
+            if retries_left <= 0
+              puts "🚨 #{url} blocked 3 times. Exiting scraper gracefully."
+              browser.quit if browser
+              exit 1
+            else
+              next
+            end
+          end
+
+          # Successfully fetched
+          pro = build_proadvisor_from_html(html, url)
+          append_result_row(pro.to_a)
+          remove_url_from_original(url)
+
+          end_time_row = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          elapsed = end_time_row - start_time_row
+          log_event(:success, "Saved! Time taken: #{elapsed.round(2)}s (#{idx + 1}/#{total_urls})")
+
+          sleep(rand(@min_between..@max_between))
+          break
+        end
       end
     ensure
       browser.quit if browser
     end
   end
 
-  def scrape_in_parallel(urls)
-    Parallel.each(urls, in_threads: @concurrency) do |url|
-      start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  def fetch_with_retries(browser, url, attempts_left = @retries + 1)
+    attempts = 0
 
-      sleep(rand(3.5..7.5))
-      proxy = pick_proxy_for_request(Thread.current.object_id)
-      user_agent = pick_user_agent
-      browser = build_browser_for_context(proxy: proxy, user_agent: user_agent)
+    begin
+      attempts += 1
+      browser.goto(url)
+      browser.network.wait_for_idle(duration: rand(5.0..7.0))
+      simulate_reading_pause(browser)
 
-      begin
-        html = fetch_with_retries(browser, url)
-        pro = build_proadvisor_from_html(html, url)
-        append_result_row(pro.to_a)
+      html = browser.body
+      return html
 
-        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
-        puts "[worker #{Thread.current.object_id}] Saved: #{url} (#{elapsed.round(2)}s)"
-
-        sleep(rand(@min_between..@max_between))
-      ensure
-        browser.quit if browser
+    rescue => e
+      puts "[Error] #{e}"
+      if attempts_left > 1
+        puts "[Retry] Retrying #{url}, attempts left: #{attempts_left - 1}"
+        sleep(rand(3..6))
+        retry
+      else
+        puts "[Failed] Could not fetch #{url} after #{attempts} attempts"
+        return nil
       end
     end
   end
@@ -167,7 +212,7 @@ class QbScraper
     browser_opts = {
       headless: @headless,
       timeout: @timeout,
-      window_size: [rand(1000..1600), rand(700..1100)],
+      window_size: [rand(800..1600), rand(600..1100)],
       browser_options: { 'no-sandbox': nil, 'disable-dev-shm-usage': nil }
     }
 
@@ -187,73 +232,51 @@ class QbScraper
     browser
   end
 
-  def fetch_with_retries(browser, url, attempts_left = @retries + 1)
-    attempts = 0
+  def simulate_reading_pause(browser, retries_left = nil)
     begin
-      attempts += 1
-      browser.go_to(url)
-      browser.network.wait_for_idle(duration: 4)
-      simulate_reading_pause(browser)
-      # guarded scroll
-      begin
-        if (body = browser.at_xpath("body"))
-          body.scroll_to(y: rand(80..700))
-          sleep(rand(0.15..0.7))
+      roll = rand
+      if roll < 0.6
+        sleep_for(15.0..18.0, retries_left)
+      elsif roll < 0.9
+        sleep_for(18.0..21.0, retries_left)
+      else
+        sleep_for(21.0..24.0, retries_left)
+      end
+
+      body = browser.at_xpath("body") rescue nil
+      if body
+        current_pos = 0
+        total_height = 1000 + rand(0..2000)
+        3.upto(rand(5..10)) do
+          increment = rand(50..200)
+          current_pos += increment
+          body.scroll_to(y: [current_pos, total_height].min)
+          sleep_for(0.75..3.0, retries_left)
         end
-      rescue => e
-        warn "Scroll error: #{e.message}"
       end
-      sleep(rand(0.05..0.4))
-      browser.body
-    rescue => e
-      warn "Browser error (attempt #{attempts}) for #{url}: #{e.message}"
-      if attempts_left > 1
-        backoff = (2 ** (attempts - 1)) + rand(0.4..1.1)
-        sleep(backoff)
-        retry
+
+      if rand < 0.08
+        w = 1000 + rand(-150..300)
+        h = 800 + rand(-150..200)
+        browser.resize(w, h) if browser.respond_to?(:resize)
       end
-      nil
+    rescue Interrupt
+      puts "⚠️ Scraper interrupted!"
+      browser.quit if browser
+      exit 1
     end
   end
 
-  def simulate_reading_pause(browser)
-    # Base pause
-    roll = rand
-    if roll < 0.6
-      sleep(rand(1.0..4.0))
-    elsif roll < 0.9
-      sleep(rand(6..12))
+  def sleep_for(range, retries_left = nil)
+    seconds = rand(range)
+    if retries_left && retries_left <= 0
+      raise Interrupt
     else
-      sleep(rand(18..35))
-    end
-
-    body = begin
-      browser.at_xpath("body")
-    rescue
-      nil
-    end
-
-    if body
-      1.upto(rand(1..3)) do
-        y_pos = rand(80..700)
-        body.scroll_to(y: y_pos)
-        sleep(rand(0.2..0.6))
-      end
-    end
-
-    # Random viewport resize
-    if rand < 0.08
-      w = 1000 + rand(-150..300)
-      h = 800 + rand(-150..200)
-      browser.resize(w, h) if browser.respond_to?(:resize)
+      sleep(seconds)
     end
   end
 
   def build_proadvisor_from_html(html, url)
-    if html.nil? || html.strip.empty?
-      return @proadvisor.new(nil, nil, nil, nil, url, nil, "Failed to fetch page content or empty body")
-    end
-
     body = Nokogiri::HTML(html)
 
     accountant_name = extract_text_by_selectors(body, [
@@ -271,7 +294,31 @@ class QbScraper
     @proadvisor.new(nil, nil, nil, nil, url, nil, "Scraping Error - #{e.message}")
   end
 
-  # helpers: parsing
+  def blocked_page?(html, url)
+    return false if html.nil? || html.strip.empty?
+
+    body = Nokogiri::HTML(html)
+
+    blocked_selectors = [
+      '#qba-matchmaking-ui-search-captcha',
+      'h2.captcha-title',
+      '.g-recaptcha',
+      "form[action*='captcha']"
+    ]
+    blocked_regex = /captcha|verify you are human|unusual traffic|security verification/i
+
+    is_blocked = blocked_regex.match?(body.text) ||
+                 blocked_selectors.any? { |sel| !body.css(sel).empty? }
+
+    if is_blocked
+      log_event(:blocked, "⚠️ CAPTCHA/security page detected on #{url}")
+      CSV.open("blocked_urls.csv", "ab") { |csv| csv << [url] }
+      return true
+    end
+
+    false
+  end
+
   def extract_text_by_selectors(body, selectors)
     selectors.each do |sel|
       begin
@@ -346,47 +393,62 @@ class QbScraper
     websites.uniq.join("; ")
   end
 
-  # helpers: UA / proxy selection
   def pick_user_agent
     @user_agents.sample
   end
 
   def pick_proxy_for_request(seed = nil)
     return nil if @proxy_list.nil? || @proxy_list.empty?
-    seed ? @proxy_list[seed.hash.abs % @proxy_list.length] : @proxy_list.sample
+
+    # Keep one proxy per thread/session for a while
+    @proxy_assignments ||= {}
+    if session_id
+      @proxy_assignments[session_id] ||= @proxy_list.sample
+      @proxy_assignments[session_id]
+    else
+      @proxy_list.sample
+    end
+  end
+
+  def remove_url_from_original(url)
+    return unless @input_source && File.exist?(@input_source)
+    
+    if @input_source.end_with?('.csv')
+      csv = CSV.table(@input_source)
+      CSV.open(@input_source, "wb", write_headers: true, headers: csv.headers) do |csv_file|
+        csv.each do |row|
+          row_url = row[:url] || row[:link] || row[:site]
+          csv_file << row unless row_url.to_s.strip == url.to_s.strip
+        end
+      end
+    else
+      lines = File.readlines(@input_source).map(&:strip)
+      lines.reject! { |line| line.strip == url.strip }
+      File.write(@input_source, lines.join("\n"))
+    end
+  end
+
+  def log_event(type, message)
+    time = Time.now.strftime("%H:%M:%S")
+    case type
+    when :incoming
+      puts "[#{time}] ⇦ INCOMING from Intuit \n #{message}"
+    when :outgoing
+      puts "[#{time}] ⇨ OUTGOING request to Intuit \n #{message}"
+    when :blocked
+      puts "[#{time}] 🚫 BLOCKED by Intuit \n #{message}"
+    when :success
+      puts "[#{time}] ✅ SUCCESS: #{message}"
+    when :error
+      puts "[#{time}] ❌ ERROR: #{message}"
+    else
+      puts "[#{time}] \n #{message}"
+    end
   end
 end
 
-# CLI
 if __FILE__ == $0
-  options = { concurrency: 1, headless: true, csv_filename: "proadvisor_results_incremental.csv" }
-
-  OptionParser.new do |opts|
-    opts.banner = "Usage: ruby qb_scraper_safe_refactor.rb [options] [URLs...]"
-    opts.on("-f", "--file FILE", "Input file (CSV or text file with URLs)") { |v| options[:file] = v }
-    opts.on("-u", "--url URL", "Single URL to scrape (can be used multiple times)") { |v| (options[:urls] ||= []) << v }
-    opts.on("-c", "--concurrency N", Integer, "Parallel threads (clamped to max 3)") { |v| options[:concurrency] = v }
-    opts.on("--proxy-list JSON", "JSON array of proxy strings (eg: '[\"host:port\"]')") { |v| options[:proxy_list] = JSON.parse(v) rescue [] }
-    opts.on("--min-between N", Float, "Min seconds between pages (default 5)") { |v| options[:min_between] = v }
-    opts.on("--max-between N", Float, "Max seconds between pages (default 18)") { |v| options[:max_between] = v }
-    opts.on("--csv FILE", "Output CSV filename (appends)") { |v| options[:csv_filename] = v }
-    opts.on("--no-headless", "Run non-headless (for debugging)") { options[:headless] = false }
-    opts.on("-h", "--help", "Show help") { puts opts; exit }
-  end.parse!
-
-  urls = options[:urls] || []
-  urls += ARGV if ARGV.any?
-
-  if options[:file]
-    scraper = QbScraper.new(input_source: options[:file], options: options)
-    scraper.run
-  elsif urls.any?
-    scraper = QbScraper.new(input_source: nil, options: options)
-    scraper.run(urls)
-  else
-    puts "No URLs or input file provided!"
-    puts "Examples:"
-    puts " ruby qb_scraper_safe_refactor.rb -f urls.csv -c 2 --csv results.csv"
-    puts " ruby qb_scraper_safe_refactor.rb -u https://proadvisor.intuit.com/... "
-  end
+  require_relative "qb_scraper_cli"
+  
+  QbScraperCLI.new(ARGV).run
 end
