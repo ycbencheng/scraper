@@ -7,8 +7,11 @@ require "uri"
 require 'byebug'
 
 require_relative "qb_scraper_config"
+require_relative "persistence/csv_queue"
 
 class QbScraper
+  CSV_HEADERS = %w(accountant_name title_text emails social_sites proadvisor_link site error).freeze
+
   def initialize(input_source: nil, options: {})
     @input_source = input_source
     @concurrency = [[options.fetch(:concurrency, 1), 1].max, 3].min # clamp 1..3
@@ -22,14 +25,17 @@ class QbScraper
     @retries = options.fetch(:retries, 3)
     @csv_filename = options.fetch(:csv_filename, "proadvisor_results_incremental.csv")
     @proadvisor = Struct.new(:accountant_name, :title_text, :emails, :social_sites, :proadvisor_link, :site, :error)
-    @mutex = Mutex.new
-
-    ensure_csv_initialized
+    @csv_queue = options.fetch(:csv_queue, nil) ||
+                 Persistence::CsvQueue.new(
+                   csv_filename: @csv_filename,
+                   input_source: @input_source,
+                   headers: CSV_HEADERS
+                 )
   end
 
   def run(direct_urls = [])
     start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    urls = load_urls(direct_urls)
+    urls = @csv_queue.load_urls(direct_urls)
     return if urls.empty?
 
     puts "--- Total of #{urls.count} ProAdvisor URLs to scrape ---"
@@ -42,74 +48,6 @@ class QbScraper
   end
 
   private
-
-  def ensure_csv_initialized
-    # Create CSV with header if missing
-    unless File.exist?(@csv_filename)
-      CSV.open(@csv_filename, "wb", write_headers: true, headers: csv_headers) do |csv|
-        # header written
-      end
-    end
-  end
-
-  def csv_headers
-    %w(accountant_name title_text emails social_sites proadvisor_link site error)
-  end
-
-  def append_result_row(row_array)
-    @mutex.synchronize do
-      CSV.open(@csv_filename, "ab", headers: csv_headers, write_headers: false) do |csv|
-        csv << row_array
-      end
-    end
-  end
-
-  def load_urls(direct_urls)
-    urls = []
-    if !direct_urls.empty?
-      urls = direct_urls
-    elsif @input_source
-      unless File.exist?(@input_source)
-        puts "Error: File '#{@input_source}' not found!"
-        return []
-      end
-
-      if @input_source.end_with?('.csv')
-        csv = CSV.table(@input_source)
-        urls = csv[:url] || csv[:link] || csv[:site] || []
-        urls = urls.compact.map(&:to_s)
-
-        # Remove URLs already in incremental CSV
-        existing_urls = File.exist?(@csv_filename) ? CSV.read(@csv_filename, headers: true).map { |row| row['proadvisor_link'] }.compact : []
-        urls.reject! { |u| existing_urls.include?(u) }
-        urls.uniq!
-
-        # Overwrite original CSV with remaining URLs
-        CSV.open(@input_source, "wb", write_headers: true, headers: csv.headers) do |csv_file|
-          csv.each do |row|
-            row_url = row[:url] || row[:link] || row[:site]
-            csv_file << row if row_url && urls.include?(row_url.to_s)
-          end
-        end
-      else
-        urls = File.readlines(@input_source).map(&:strip).reject(&:empty?)
-        # Remove URLs already in incremental CSV
-        existing_urls = File.exist?(@csv_filename) ? CSV.read(@csv_filename, headers: true).map { |row| row['proadvisor_link'] }.compact : []
-        urls.reject! { |u| existing_urls.include?(u) }
-        urls.uniq!
-        File.write(@input_source, urls.join("\n"))
-      end
-    end
-
-    urls.map! do |u|
-      u = u.strip
-      u = "https://#{u}" unless u.match?(/^https?:\/\//i)
-      u
-    end
-
-    puts "Running dedup ...."
-    urls
-  end
 
   def scrape_sequential(urls)
     total_urls = urls.size
@@ -145,8 +83,8 @@ class QbScraper
 
           # Successfully fetched
           pro = build_proadvisor_from_html(html, url)
-          append_result_row(pro.to_a)
-          remove_url_from_original(url)
+          @csv_queue.append(pro.to_a)
+          @csv_queue.remove_source_url(url)
 
           end_time_row = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           elapsed = end_time_row - start_time_row
@@ -371,24 +309,6 @@ class QbScraper
       @proxy_assignments[session_id]
     else
       @proxy_list.sample
-    end
-  end
-
-  def remove_url_from_original(url)
-    return unless @input_source && File.exist?(@input_source)
-    
-    if @input_source.end_with?('.csv')
-      csv = CSV.table(@input_source)
-      CSV.open(@input_source, "wb", write_headers: true, headers: csv.headers) do |csv_file|
-        csv.each do |row|
-          row_url = row[:url] || row[:link] || row[:site]
-          csv_file << row unless row_url.to_s.strip == url.to_s.strip
-        end
-      end
-    else
-      lines = File.readlines(@input_source).map(&:strip)
-      lines.reject! { |line| line.strip == url.strip }
-      File.write(@input_source, lines.join("\n"))
     end
   end
 end
