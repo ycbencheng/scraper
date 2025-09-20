@@ -3,7 +3,6 @@ require 'json'
 
 class QbScraperCLI
   DEFAULT_OPTIONS = {
-    concurrency: 1,
     headless: true,
     csv_filename: "proadvisor_results_incremental.csv"
   }.freeze
@@ -44,7 +43,6 @@ class QbScraperCLI
       opts.banner = "Usage: ruby qb_scraper_safe_refactor.rb [options] [URLs...]"
       opts.on("-f", "--file FILE", "Input file (CSV or text file with URLs)") { |v| @options[:file] = v }
       opts.on("-u", "--url URL", "Single URL to scrape (can be used multiple times)") { |v| (@options[:urls] ||= []) << v }
-      opts.on("-c", "--concurrency N", Integer, "Parallel threads (clamped to max 3)") { |v| @options[:concurrency] = v }
       opts.on("--proxy-list JSON", "JSON array of proxy strings (eg: '[\"host:port\"]')") { |v| @options[:proxy_list] = JSON.parse(v) rescue [] }
       opts.on("--min-between N", Float, "Min seconds between pages (default 5)") { |v| @options[:min_between] = v }
       opts.on("--max-between N", Float, "Max seconds between pages (default 18)") { |v| @options[:max_between] = v }
