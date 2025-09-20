@@ -6,8 +6,9 @@ require 'launchy'
 require "uri"
 require 'byebug'
 
+require_relative "event_logger"
 require_relative "qb_scraper_config"
-require_relative "persistence/csv_queue"
+require_relative "csv_queue"
 
 class QbScraper
   CSV_HEADERS = %w(accountant_name title_text emails social_sites proadvisor_link site error).freeze
@@ -26,7 +27,7 @@ class QbScraper
     @csv_filename = options.fetch(:csv_filename, "proadvisor_results_incremental.csv")
     @proadvisor = Struct.new(:accountant_name, :title_text, :emails, :social_sites, :proadvisor_link, :site, :error)
     @csv_queue = options.fetch(:csv_queue, nil) ||
-                 Persistence::CsvQueue.new(
+                 CsvQueue.new(
                    csv_filename: @csv_filename,
                    input_source: @input_source,
                    headers: CSV_HEADERS

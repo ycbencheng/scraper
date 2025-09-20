@@ -7,7 +7,7 @@ class EventLogger
     error:    "❌ ERROR"
   }.freeze
 
-  def log(type, message)
+  def self.log(type, message)
     time = Time.now.strftime("%H:%M:%S")
     label = EVENT_ICONS[type] || ""
     puts "[#{time}] #{label}\n #{message}"
