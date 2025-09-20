@@ -8,17 +8,8 @@ class CsvQueue
     ensure_csv_initialized
   end
 
-  def load_urls(direct_urls)
-    urls =
-      if !direct_urls.empty?
-        direct_urls
-      elsif @input_source
-        load_from_input_source
-      else
-        []
-      end
-
-    urls = urls.compact
+  def load_urls()
+    urls = load_from_input_source.compact
     urls.map! do |u|
       u = u.strip
       u = "https://#{u}" unless u.match?(/^https?:\/\//i)

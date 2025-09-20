@@ -6,7 +6,7 @@ class CaptchaMitigation
     @sleep_interval = sleep_interval
   end
 
-  def handle(html:, url:, retries_left:, _browser:, total_retries:)
+  def handle(html:, url:, retries_left:, total_retries:)
     return { status: :ok, retries_left: retries_left } unless @blocked_page_detector.blocked?(html, url: url)
 
     puts "Blocked detected. Open browser and solve CAPTCHA (waiting #{@sleep_interval}s)..."
