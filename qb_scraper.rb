@@ -6,36 +6,14 @@ require 'launchy'
 require "uri"
 require 'byebug'
 
+require_relative "qb_scraper_config"
+
 class QbScraper
-  USER_AGENTS = [
-    # Chrome (macOS)
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.6074.119 Safari/537.36",
-    # Chrome (Windows)
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.5993.117 Safari/537.36",
-    # Firefox (Windows)
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-    # Firefox (macOS)
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13.6; rv:122.0) Gecko/20100101 Firefox/122.0",
-    # Safari (macOS)
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15",
-    # iPhone Safari
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/605.1.15",
-    # Android Chrome
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.6045.117 Mobile Safari/537.36",
-    # Edge (Windows)
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
-  ].freeze
-
-  DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
-
   def initialize(input_source: nil, options: {})
     @input_source = input_source
     @concurrency = [[options.fetch(:concurrency, 1), 1].max, 3].min # clamp 1..3
-    @user_agents = options.fetch(:user_agents, USER_AGENTS)
-    @accept_language = options.fetch(:accept_language, DEFAULT_ACCEPT_LANGUAGE)
+    @user_agents = options.fetch(:user_agents, QbScraperConfig::USER_AGENTS)
+    @accept_language = options.fetch(:accept_language, QbScraperConfig::DEFAULT_ACCEPT_LANGUAGE)
     @proxy_list = options.fetch(:proxy_list, []) # strings like "host:port" or "http://user:pass@host:port"
     @headless = options.fetch(:headless, true)
     @timeout = options.fetch(:timeout, 30)
@@ -139,7 +117,7 @@ class QbScraper
 
     begin
       urls.each_with_index do |url, idx|
-        log_event(:outgoing, "Starting #{idx + 1}/#{total_urls}, Url: #{url}")
+        EventLogger.log(:outgoing, "Starting #{idx + 1}/#{total_urls}, Url: #{url}")
         retries_left = 3
         start_time_row = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
@@ -172,7 +150,7 @@ class QbScraper
 
           end_time_row = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           elapsed = end_time_row - start_time_row
-          log_event(:success, "Saved! Time taken: #{elapsed.round(2)}s (#{idx + 1}/#{total_urls})")
+          EventLogger.log(:success, "Saved! Time taken: #{elapsed.round(2)}s (#{idx + 1}/#{total_urls})")
 
           sleep(rand(@min_between..@max_between))
           break
@@ -311,7 +289,7 @@ class QbScraper
                  blocked_selectors.any? { |sel| !body.css(sel).empty? }
 
     if is_blocked
-      log_event(:blocked, "⚠️ CAPTCHA/security page detected on #{url}")
+      EventLogger.log(:blocked, "⚠️ CAPTCHA/security page detected on #{url}")
       CSV.open("blocked_urls.csv", "ab") { |csv| csv << [url] }
       return true
     end
@@ -345,17 +323,6 @@ class QbScraper
   end
 
   def parse_social_sites_from_body(body)
-    social_domains = %w[
-      facebook.com
-      twitter.com
-      x.com
-      linkedin.com
-      instagram.com
-      youtube.com
-      pinterest.com
-      tiktok.com
-    ]
-
     all_links = body.xpath("//a[@href]").map { |l| l['href'].to_s.strip }.compact
 
     social = all_links.select do |url|
@@ -365,7 +332,7 @@ class QbScraper
         next false if host.empty?
 
         # allow exact domain or any subdomain (subdomain.facebook.com)
-        social_domains.any? do |d|
+        QbScraperConfig::SOCIAL_DOMAINS.any? do |d|
           host == d || host.end_with?(".#{d}")
         end
       rescue URI::InvalidURIError
@@ -376,20 +343,17 @@ class QbScraper
     social.uniq.join("; ")
   end
 
-
   def parse_site_from_body(body)
     websites = []
-    website_selectors = [
-      "//a[contains(@class, 'website')]/@href","//a[contains(@class, 'url')]/@href",
-      "//a[contains(text(), 'Website')]/@href","//a[contains(text(), 'Visit')]/@href",
-      "//div[contains(@class, 'website')]//a/@href"
-    ]
-    website_selectors.each do |sel|
+    QbScraperConfig::WEBSITE_SELECTORS.each do |sel|
       links = body.xpath(sel)
       websites += links.map(&:value)
     end
-    excluded = %w(facebook.com twitter.com linkedin.com instagram.com proadvisor.intuit.com intuit.com)
-    websites = websites.select { |u| u.start_with?('http') && excluded.none? { |d| u.include?(d) } }
+
+    websites = websites.select do |u|
+      u.start_with?('http') && QbScraperConfig::WEBSITE_EXCLUDED_DOMAINS.none? { |d| u.include?(d) }
+    end
+
     websites.uniq.join("; ")
   end
 
@@ -425,24 +389,6 @@ class QbScraper
       lines = File.readlines(@input_source).map(&:strip)
       lines.reject! { |line| line.strip == url.strip }
       File.write(@input_source, lines.join("\n"))
-    end
-  end
-
-  def log_event(type, message)
-    time = Time.now.strftime("%H:%M:%S")
-    case type
-    when :incoming
-      puts "[#{time}] ⇦ INCOMING from Intuit \n #{message}"
-    when :outgoing
-      puts "[#{time}] ⇨ OUTGOING request to Intuit \n #{message}"
-    when :blocked
-      puts "[#{time}] 🚫 BLOCKED by Intuit \n #{message}"
-    when :success
-      puts "[#{time}] ✅ SUCCESS: #{message}"
-    when :error
-      puts "[#{time}] ❌ ERROR: #{message}"
-    else
-      puts "[#{time}] \n #{message}"
     end
   end
 end
