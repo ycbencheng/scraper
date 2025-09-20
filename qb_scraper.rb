@@ -1,6 +1,5 @@
 require "nokogiri"
 require 'csv'
-require 'ferrum'
 require 'launchy'
 require "uri"
 require 'byebug'
@@ -8,6 +7,8 @@ require 'byebug'
 require_relative "event_logger"
 require_relative "qb_scraper_config"
 require_relative "csv_queue"
+require_relative "browser_session"
+require_relative "proadvisor_parser"
 
 class QbScraper
   CSV_HEADERS = %w(accountant_name title_text emails social_sites proadvisor_link site error).freeze
@@ -30,6 +31,7 @@ class QbScraper
                    input_source: @input_source,
                    headers: CSV_HEADERS
                  )
+    @parser = options.fetch(:proadvisor_parser, ProadvisorParser.new(@proadvisor))
   end
 
   def run(direct_urls = [])
@@ -49,11 +51,19 @@ class QbScraper
 
   def scrape_sequential(urls)
     total_urls = urls.size
-    browser = build_browser_for_context(proxy: pick_proxy_for_request(nil), user_agent: pick_user_agent)
+    session_helper = BrowserSession.new(
+      headless: @headless,
+      timeout: @timeout,
+      accept_language: @accept_language,
+      retries: @retries,
+      proxy: pick_proxy_for_request(nil),
+      user_agent: pick_user_agent
+    )
+    browser = session_helper.build
 
     begin
       urls.each_with_index do |url, idx|
-        process_url(browser, url, idx, total_urls)
+        process_url(session_helper, browser, url, idx, total_urls)
       end
     ensure
       browser.quit if browser
@@ -85,13 +95,13 @@ class QbScraper
     end
   end
 
-  def process_url(browser, url, index, total_urls)
+  def process_url(session_helper, browser, url, index, total_urls)
     EventLogger.log(:outgoing, "Starting #{index + 1}/#{total_urls}, Url: #{url}")
     start_time_row = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     retries_left = @retries
 
     while retries_left > 0
-      html = fetch_with_retries(browser, url)
+      html = session_helper.fetch_with_retries(browser, url)
       if html.nil?
         puts "Failed to fetch #{url}, skipping..."
         return
@@ -112,7 +122,7 @@ class QbScraper
         end
       end
 
-      pro = build_proadvisor_from_html(html, url)
+      pro = @parser.parse(html, url)
       @csv_queue.append(pro.to_a)
       @csv_queue.remove_source_url(url)
 
@@ -123,92 +133,6 @@ class QbScraper
       sleep(rand(@min_between..@max_between))
       return
     end
-  end
-
-  def build_browser_for_context(proxy: nil, user_agent: nil)
-    browser_opts = {
-      headless: @headless,
-      timeout: @timeout,
-      window_size: [rand(800..1600), rand(600..1100)],
-      browser_options: { 'no-sandbox': nil, 'disable-dev-shm-usage': nil }
-    }
-
-    if proxy && !proxy.to_s.strip.empty?
-      # Ferrum/Chromium passes proxy via --proxy-server
-      browser_opts[:browser_options]['--proxy-server'] = proxy
-    end
-
-    browser = Ferrum::Browser.new(**browser_opts)
-
-    user_agent ||= pick_user_agent
-    browser.headers.set("User-Agent" => user_agent, "Accept-Language" => @accept_language)
-
-    # NOTE: we intentionally DO NOT perform aggressive fingerprint evasion here.
-    # Advanced evasion is fragile and likely to escalate defenses. Focus on polite timing & UA diversity.
-
-    browser
-  end
-
-  def simulate_reading_pause(browser, retries_left = nil)
-    begin
-      roll = rand
-      if roll < 0.6
-        sleep_for(15.0..18.0, retries_left)
-      elsif roll < 0.9
-        sleep_for(18.0..21.0, retries_left)
-      else
-        sleep_for(21.0..24.0, retries_left)
-      end
-
-      body = browser.at_xpath("body") rescue nil
-      if body
-        current_pos = 0
-        total_height = 1000 + rand(0..2000)
-        3.upto(rand(5..10)) do
-          increment = rand(50..200)
-          current_pos += increment
-          body.scroll_to(y: [current_pos, total_height].min)
-          sleep_for(0.75..3.0, retries_left)
-        end
-      end
-
-      if rand < 0.08
-        w = 1000 + rand(-150..300)
-        h = 800 + rand(-150..200)
-        browser.resize(w, h) if browser.respond_to?(:resize)
-      end
-    rescue Interrupt
-      puts "⚠️ Scraper interrupted!"
-      browser.quit if browser
-      exit 1
-    end
-  end
-
-  def sleep_for(range, retries_left = nil)
-    seconds = rand(range)
-    if retries_left && retries_left <= 0
-      raise Interrupt
-    else
-      sleep(seconds)
-    end
-  end
-
-  def build_proadvisor_from_html(html, url)
-    body = Nokogiri::HTML(html)
-
-    accountant_name = extract_text_by_selectors(body, [
-      "h1.accountant-name","h1[class*='name']","div.profile-name h1","div[class*='accountant'] h1",
-      "h2.accountant-name","span.accountant-name","div.name-container","h1",".profile-header h1"
-    ])
-    title_text = extract_text_by_selectors(body, [
-      "div.title","span.title","p.designation","div.professional-title","span.job-title","div[class*='title']","span[class*='designation']","//*[@data-testid='professional-title']"
-    ])
-    emails = parse_emails_from_body(body)
-    social_sites = parse_social_sites_from_body(body)
-    site = parse_site_from_body(body)
-    @proadvisor.new(accountant_name, title_text, emails, social_sites, url, site, nil)
-  rescue StandardError => e
-    @proadvisor.new(nil, nil, nil, nil, url, nil, "Scraping Error - #{e.message}")
   end
 
   def blocked_page?(html, url)
@@ -234,66 +158,6 @@ class QbScraper
     end
 
     false
-  end
-
-  def extract_text_by_selectors(body, selectors)
-    selectors.each do |sel|
-      begin
-        element = sel.start_with?('//') ? body.xpath(sel).first : body.css(sel).first
-        next unless element
-        text = element.text.strip
-        return text unless text.empty?
-      rescue
-        next
-      end
-    end
-    nil
-  end
-
-  def parse_emails_from_body(body)
-    emails = []
-    mailto = body.xpath("//a[starts-with(@href, 'mailto:')]/@href")
-    emails += mailto.map { |l| l.value.sub('mailto:', '') }
-    email_pattern = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/
-    emails += body.text.scan(email_pattern)
-    contacts = body.xpath("//div[contains(@class, 'contact')]//text() | //section[contains(@class, 'contact')]//text()")
-    contacts.each { |t| emails += t.to_s.scan(email_pattern) }
-    emails.uniq.join("; ")
-  end
-
-  def parse_social_sites_from_body(body)
-    all_links = body.xpath("//a[@href]").map { |l| l['href'].to_s.strip }.compact
-
-    social = all_links.select do |url|
-      begin
-        host = URI.parse(url).host.to_s.downcase
-        # skip empty hosts
-        next false if host.empty?
-
-        # allow exact domain or any subdomain (subdomain.facebook.com)
-        QbScraperConfig::SOCIAL_DOMAINS.any? do |d|
-          host == d || host.end_with?(".#{d}")
-        end
-      rescue URI::InvalidURIError
-        false
-      end
-    end
-
-    social.uniq.join("; ")
-  end
-
-  def parse_site_from_body(body)
-    websites = []
-    QbScraperConfig::WEBSITE_SELECTORS.each do |sel|
-      links = body.xpath(sel)
-      websites += links.map(&:value)
-    end
-
-    websites = websites.select do |u|
-      u.start_with?('http') && QbScraperConfig::WEBSITE_EXCLUDED_DOMAINS.none? { |d| u.include?(d) }
-    end
-
-    websites.uniq.join("; ")
   end
 
   def pick_user_agent
