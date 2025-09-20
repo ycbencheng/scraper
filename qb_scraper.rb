@@ -447,6 +447,7 @@ class QbScraper
   end
 end
 
+# CLI
 if __FILE__ == $0
   require_relative "qb_scraper_cli"
   
