@@ -8,7 +8,7 @@ class CsvQueue
     ensure_csv_initialized
   end
 
-  def load_urls()
+  def load_urls
     urls = load_from_input_source.compact
     urls.map! do |u|
       u = u.strip
@@ -17,7 +17,7 @@ class CsvQueue
     end
 
     puts "Running dedup ...."
-    urls
+    urls.uniq
   end
 
   def append(row_array)

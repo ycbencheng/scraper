@@ -18,8 +18,8 @@ class QbScraper
     @proxy_list = []
     @headless = true
     @timeout = 30
-    @min_between = 8.0
-    @max_between = @min_between + rand(3.0..5.0)
+    @min_between = 30.0
+    @max_between = 60.0
     @retries = 3
     @csv_queue = CsvQueue.new(
                    csv_filename: "proadvisor_results_incremental.csv",
@@ -30,9 +30,9 @@ class QbScraper
     @proxy_assignments = {}
   end
 
-  def run()
+  def run
     start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    urls = @csv_queue.load_urls()
+    urls = @csv_queue.load_urls
     return if urls.empty?
 
     @progress_reporter.report_start(total_urls: urls.count)
@@ -96,7 +96,9 @@ class QbScraper
 
       @progress_reporter.report_success(index: index, total: total_urls, started_at: start_time_row)
 
-      sleep(rand(@min_between..@max_between))
+      sleeping_for = rand(@min_between..@max_between)
+      puts "Sleeping for #{sleeping_for} seconds"
+      sleep(sleeping_for)
       return
     end
   end

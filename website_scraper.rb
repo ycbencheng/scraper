@@ -31,8 +31,8 @@ class WebsiteScraper
 
   def initialize(csv_file, options = {})
     @csv_file = csv_file
-    @threads = options[:threads] || 4
-    @timeout = options[:timeout] || 10
+    @threads = options[:threads] || 8
+    @timeout = options[:timeout] || 20
     @semaphore = Mutex.new
     @updated_rows = []
   end
@@ -80,7 +80,7 @@ class WebsiteScraper
       scraped_data = scrape_site(site_url, {
         email: needs_email,
         socials: needs_socials
-      })
+      }, csv_table, index)
       
       @semaphore.synchronize do
         if scraped_data[:email] && needs_email
@@ -140,38 +140,40 @@ class WebsiteScraper
 
   def prepare_url(site)
     site = site.strip
-    site = site.sub(%r{^https?:(//|\\\\)(www\.)?}i, '')
-    site = site.split('/').first
-    "https://#{site}"
+
+    if site =~ %r{^https?://}i
+      site
+    else
+      "https://#{site}"
+    end
   end
 
-  def scrape_site(site, needs)
+  def scrape_site(site, needs, csv_table, index)
     result = {}
     
     pages_to_check = [
-      '', '/about', '/contact', '/contact-us', '/about-us', '/contactus', '/aboutus', 'team', 'teams'
+      '', '/about', '/about-us', '/aboutus', '/contactus', '/contact', '/contacts',
+      '/contact-us', '/team', '/teams'
     ]
     
     pages_to_check.each do |page_path|
       break if has_all_needed?(result, needs)
-      
-      url = "#{site}#{page_path}"
-      
-      begin
-        response = fetch_page(url)
-        body = Nokogiri::HTML(response.body)
 
+      url = "#{site}#{page_path}"
+
+      begin
+        response = fetch_page(url, csv_table, index)
+        
         next if response.body.nil? || response.code >= 400
 
-        if needs[:email] && result[:email].nil?
-          result[:email] = parse_email(body)
-        end
-        
-        if needs[:socials] && result[:socials].nil?
-          result[:socials] = parse_socials(body)
-        end
-        
-      rescue StandardError
+        body = Nokogiri::HTML(response.body)
+
+        result[:email]   ||= parse_email(body)   if needs[:email]
+        result[:socials] ||= parse_socials(body) if needs[:socials]
+
+      rescue StandardError => e
+        add_note(csv_table, index, url, "Extract error: #{e.class} - #{e.message}")
+        puts e.backtrace.first(3).join("\n")  # show top of stack
         next
       end
     end
@@ -179,7 +181,7 @@ class WebsiteScraper
     result
   end
 
-  def fetch_page(url)
+  def fetch_page(url, csv_table, index, tried_http: false)
     HTTParty.get(url, {
       headers: { "User-Agent" => USER_AGENT },
       timeout: @timeout,
@@ -187,10 +189,36 @@ class WebsiteScraper
       limit: 3
     })
   rescue Net::OpenTimeout, Net::ReadTimeout
-    puts "  Timeout for #{url}"
+    add_note(csv_table, index, url, "Timeout")
     nil
-  rescue StandardError
+  rescue SocketError, Errno::ECONNREFUSED
+    if url.start_with?("https://") && !tried_http
+      fallback = url.sub(/^https:/, "http:")
+      puts "  Falling back to #{fallback}"
+      fetch_page(fallback, csv_table, index, tried_http: true)
+    else
+      add_note(csv_table, index, url, "Connection refused")
+      nil
+    end
+  rescue HTTParty::RedirectionTooDeep
+    add_note(csv_table, index, url, "Redirect loop / too many redirects")
     nil
+  rescue StandardError => e
+    add_note(csv_table, index, url, "Fetch error: #{e.class} - #{e.message}")
+    nil
+  end
+
+  def add_note(csv_table, idx, site_url, message)
+    @semaphore.synchronize do
+      existing = (csv_table[idx][:notes] || "").strip
+      if existing.empty?
+        csv_table[idx][:notes] = message
+        puts "  ⚠️ [#{site_url}] #{message}"
+      else
+        # Already has a note, skip adding more
+        puts "  ⚠️ [#{site_url}] (skipped additional note: #{message})"
+      end
+    end
   end
 
   def has_all_needed?(result, needs)

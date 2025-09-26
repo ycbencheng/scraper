@@ -47,7 +47,7 @@ class BrowserSession
     begin
       attempt_number += 1
       browser.goto(url)
-      browser.network.wait_for_idle(duration: rand(5.0..7.0))
+      browser.network.wait_for_idle(duration: rand(6.0..10.0))
       simulate_reading_pause(browser)
 
       browser.body
@@ -56,7 +56,7 @@ class BrowserSession
       attempts_left = max_attempts - attempt_number
       if attempts_left.positive?
         puts "[Retry] Retrying #{url} (attempt #{attempt_number + 1}/#{max_attempts})"
-        sleep(rand(3..6))
+        sleep(rand(5..8))
         retry
       else
         puts "[Failed] Could not fetch #{url} after #{attempt_number} attempts"
@@ -69,22 +69,22 @@ class BrowserSession
     begin
       roll = rand
       if roll < 0.6
-        sleep_for(15.0..18.0, retries_left)
+        sleep_for(25.0..30.0, retries_left)
       elsif roll < 0.9
-        sleep_for(18.0..21.0, retries_left)
+        sleep_for(30.0..35.0, retries_left)
       else
-        sleep_for(21.0..24.0, retries_left)
+        sleep_for(35.0..40.0, retries_left)
       end
 
       body = browser.at_xpath('body') rescue nil
       if body
         current_pos = 0
         total_height = 1000 + rand(0..2000)
-        3.upto(rand(5..10)) do
-          increment = rand(50..200)
+        3.upto(rand(5..7)) do
+          increment = rand(50..250)
           current_pos += increment
           body.scroll_to(y: [current_pos, total_height].min)
-          sleep_for(0.75..3.0, retries_left)
+          sleep_for(3.0..6.0, retries_left)
         end
       end
 
